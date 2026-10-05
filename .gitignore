@@ -1,11 +1,14 @@
 # 构建产物（不上传）
-dist/*.exe
-dist/app.ico
-dist/app.resources
-dist/*.zip
-dist/*.7z
+dist/
 build/
 *.spec
+
+# C# 源码（仅保留Python源码）
+*.cs
+
+# 旧构建脚本
+build.py
+requirements.txt
 
 # Python
 __pycache__/
