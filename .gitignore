@@ -1,0 +1,36 @@
+# 构建产物（不上传）
+dist/*.exe
+dist/app.ico
+dist/app.resources
+dist/*.zip
+dist/*.7z
+build/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.pytest_cache/
+
+# 配置文件（包含密钥，用模板代替）
+config.ini
+*.bak
+
+# 临时文件
+temp_screenshot.png
+*.tmp
+Thumbs.db
+Desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 测试文件
+test_*.py

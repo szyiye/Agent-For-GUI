@@ -1,0 +1,28 @@
+[api]
+# 主模型API配置
+api_url = https://api.openai.com/v1
+api_key = your_api_key_here
+model = gpt-4o
+api_format = openai
+thinking_mode = default
+
+# 图片转述模型API配置（留空则复用主模型的api_url和api_key）
+transcribe_api_url =
+transcribe_api_key =
+transcribe_model = mimo-v2.5
+
+# 是否开启图片转述模型 (true=截图先转文字再给主模型, false=截图直接发给主模型)
+use_transcribe = true
+
+[prompts]
+system_prompt_file = system_prompt.txt
+default_prompt = 请帮我查看当前屏幕内容，并告诉我你看到了什么。
+
+[settings]
+screenshot_temp = temp_screenshot.png
+screenshot_quality = 80
+# 截图最大宽度（0 = 不缩放，直接用原始分辨率发给AI）
+max_image_width = 0
+command_delay = 0.3
+auto_execute = true
+max_turns = 100
