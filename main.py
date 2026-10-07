@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-AI屏幕控制器 - 全自动CLI版本
+AI屏幕控制器 - 全自动GUI版本
 主模型(mimo-v2.6-pro)自主决策，截图经转述模型(mimo-v2.5)转成文字后喂回主模型
 """
 
@@ -12,7 +12,10 @@ import re
 import time
 import base64
 import io
+import queue
 import subprocess
+import threading
+import traceback
 import ctypes
 from ctypes import wintypes
 from pathlib import Path
@@ -23,9 +26,14 @@ try:
     import requests
     import mss
 except ImportError as e:
-    print(f"[错误] 缺少必要的库: {e}")
-    print("请运行: pip install pyautogui Pillow requests mss")
-    input("按Enter键退出...")
+    try:
+        import tkinter.messagebox as _mb
+        import tkinter as _tk
+        _r = _tk.Tk(); _r.withdraw()
+        _mb.showerror("AI Controller", f"缺少必要的库: {e}\n请运行: pip install pyautogui Pillow requests mss")
+        _r.destroy()
+    except Exception:
+        pass
     sys.exit(1)
 
 # 禁用pyautogui的安全暂停和失败保护
@@ -39,8 +47,18 @@ class AIController:
     def __init__(self, config_path='config.ini'):
         """初始化控制器"""
         self.config_path = config_path
+
+        # exe/脚本所在目录（用于查找随附文件，如配置向导、捆绑的提示词）
+        if getattr(sys, 'frozen', False):
+            self.app_dir = os.path.dirname(sys.executable)
+        else:
+            self.app_dir = os.path.dirname(os.path.abspath(__file__))
+
         self.config = configparser.ConfigParser()
         self.load_config()
+
+        # 配置目录（load_config可能因权限回退而更新config_path，必须在首次检测之前赋值）
+        self.base_dir = os.path.dirname(os.path.abspath(self.config_path))
 
         # API配置
         self._read_api_config()
@@ -48,9 +66,10 @@ class AIController:
         # 首次运行检测
         if self._is_first_run():
             self._launch_wizard()
+            # 向导可能更新了config_path，同步配置目录
+            self.base_dir = os.path.dirname(os.path.abspath(self.config_path))
 
         # 提示词（从txt文件读取）
-        self.base_dir = os.path.dirname(os.path.abspath(self.config_path))
         prompt_file = self.config.get('prompts', 'system_prompt_file', fallback='system_prompt.txt')
         self.system_prompt = self._load_prompt_file(prompt_file)
         self.default_prompt = self.config.get('prompts', 'default_prompt')
@@ -63,6 +82,7 @@ class AIController:
         self.max_turns = self.config.getint('settings', 'max_turns')
 
         # 运行状态
+        self.stop_requested = False        # GUI停止按钮请求标志
         self.conversation_history = []
         self.last_screenshot = None          # 最近一次截图的base64
         self.system_info = None              # 系统配置信息（缓存，只收集一次）
@@ -114,10 +134,9 @@ class AIController:
             print(f"[提示] 配置文件不存在，正在生成默认配置...")
             self._generate_default_config()
             self._generate_default_prompt()
-            return
 
         try:
-            with open(self.config_path, 'r', encoding='utf-8') as f:
+            with open(self.config_path, 'r', encoding='utf-8-sig') as f:
                 self.config.read_file(f)
         except configparser.Error as e:
             print(f"[警告] config.ini 解析失败（可能是旧版格式）: {e}")
@@ -141,7 +160,7 @@ class AIController:
         """从损坏的旧版config.ini中提取API设置"""
         settings = {}
         try:
-            with open(self.config_path, 'r', encoding='utf-8') as f:
+            with open(self.config_path, 'r', encoding='utf-8-sig') as f:
                 content = f.read()
             for key in ['api_url', 'api_key', 'model', 'api_format', 'thinking_mode', 'transcribe_api_url', 'transcribe_api_key', 'transcribe_model']:
                 match = re.search(rf'^\s*{key}\s*=\s*(.+)$', content, re.MULTILINE)
@@ -187,13 +206,31 @@ class AIController:
             "max_turns = 100",
             "",
         ]
-        with open(self.config_path, 'w', encoding='utf-8') as f:
-            f.write("\n".join(lines))
+        content = "\n".join(lines)
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(self.config_path)), exist_ok=True)
+            with open(self.config_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+        except OSError:
+            # exe目录无写权限（如 C:\Program Files\），回退到 %APPDATA%\AI_Controller\
+            appdata = os.environ.get('APPDATA') or os.path.join(os.path.expanduser('~'), 'AppData', 'Roaming')
+            fallback_dir = os.path.join(appdata, 'AI_Controller')
+            os.makedirs(fallback_dir, exist_ok=True)
+            self.config_path = os.path.join(fallback_dir, 'config.ini')
+            print(f"[提示] 安装目录无写权限，配置文件改存到: {self.config_path}")
+            with open(self.config_path, 'w', encoding='utf-8') as f:
+                f.write(content)
         print(f"[完成] 已生成新配置: {self.config_path}")
 
     def _generate_default_prompt(self):
-        """生成默认system_prompt.txt"""
-        prompt_path = os.path.join(self.base_dir if hasattr(self, 'base_dir') else os.path.dirname(os.path.abspath(self.config_path)), 'system_prompt.txt')
+        """生成默认system_prompt.txt（exe安装目录无写权限时回退到配置目录）"""
+        # 1. 若安装目录已有随附提示词，直接复用
+        bundled_path = os.path.join(self.app_dir, 'system_prompt.txt')
+        if os.path.exists(bundled_path):
+            return
+        # 2. 优先写入配置目录（可能因权限回退到 %APPDATA%）
+        fallback_dir = os.path.dirname(os.path.abspath(self.config_path))
+        prompt_path = os.path.join(fallback_dir, 'system_prompt.txt')
         if os.path.exists(prompt_path):
             return
         content = (
@@ -217,9 +254,20 @@ class AIController:
             "11. {stop} - 结束任务\n\n"
             "请用中文回复，每次回复开头用一句话说明你要做什么，然后输出命令。\n"
         )
-        with open(prompt_path, 'w', encoding='utf-8') as f:
-            f.write(content)
-        print(f"[完成] 已生成提示词: {prompt_path}")
+        try:
+            with open(prompt_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            print(f"[完成] 已生成提示词: {prompt_path}")
+        except OSError:
+            # 写入配置目录也失败时回退到 %APPDATA%\AI_Controller\
+            appdata = os.environ.get('APPDATA') or os.path.join(os.path.expanduser('~'), 'AppData', 'Roaming')
+            fallback_dir = os.path.join(appdata, 'AI_Controller')
+            os.makedirs(fallback_dir, exist_ok=True)
+            prompt_path = os.path.join(fallback_dir, 'system_prompt.txt')
+            if not os.path.exists(prompt_path):
+                with open(prompt_path, 'w', encoding='utf-8') as f:
+                    f.write(content)
+                print(f"[完成] 已生成提示词: {prompt_path}")
 
     def _collect_system_info(self):
         """收集系统配置信息（支持多CPU/GPU/网卡/ROM，缓存）"""
@@ -314,7 +362,7 @@ class AIController:
         self._generate_default_prompt()
         # 重新加载
         self.config = configparser.ConfigParser()
-        with open(self.config_path, 'r', encoding='utf-8') as f:
+        with open(self.config_path, 'r', encoding='utf-8-sig') as f:
             self.config.read_file(f)
         print("[完成] 配置已修复并重新加载")
 
@@ -325,7 +373,7 @@ class AIController:
 
     def _launch_wizard(self):
         """首次运行时启动配置向导"""
-        wizard_path = os.path.join(self.base_dir, 'config_wizard.exe')
+        wizard_path = os.path.join(self.app_dir, 'config_set.exe')
         print("\n" + "=" * 60)
         print("[首次运行] 检测到未配置API，启动配置向导...")
         print("=" * 60)
@@ -337,13 +385,16 @@ class AIController:
                 print(f"[错误] 启动配置向导失败: {e}")
                 return
 
-            # 向导关闭后重新加载配置
+            # 向导关闭后重新加载配置（向导可能把配置写在exe目录，优先采用）
+            local_config = os.path.join(self.app_dir, 'config.ini')
+            if os.path.exists(local_config):
+                self.config_path = local_config
             self.config = configparser.ConfigParser()
             self.load_config()
             self._read_api_config()
             print("[完成] 配置已重新加载")
         else:
-            print(f"[警告] 未找到配置向导: {wizard_path}")
+            print(f"[警告] 未找到配置向导")
             print("请手动编辑 config.ini 填写API配置")
 
     def _read_api_config(self):
@@ -359,47 +410,103 @@ class AIController:
         transcribe_url = self.config.get('api', 'transcribe_api_url', fallback='').strip()
         transcribe_key = self.config.get('api', 'transcribe_api_key', fallback='').strip()
         if transcribe_url:
-            self.transcribe_api_url = self._normalize_api_url(transcribe_url)
+            self.transcribe_api_url = self._normalize_api_url(transcribe_url, fmt='openai')
         else:
             self.transcribe_api_url = self.api_url
         self.transcribe_api_key = transcribe_key if transcribe_key else self.api_key
 
-    def _normalize_api_url(self, url):
-        """自动补全API接口路径（根据API格式）"""
-        url = url.strip().rstrip('/')
+    def reload_config(self):
+        """设置向导保存后重新加载配置（供「设置」按钮切换模型），返回新模型名。
 
-        if self.api_format == 'anthropic':
-            # Anthropic: {base}/messages
+        刷新 API 配置、提示词与运行设置，并同步会话历史中的系统提示词；
+        不清空对话历史（保留上下文）。文件缺失/损坏时沿用 load_config 的
+        默认生成/自动修复逻辑。
+        """
+        # 向导可能把配置写在 exe 目录（优先采用），与 _launch_wizard 的重载逻辑一致
+        local_config = os.path.join(self.app_dir, 'config.ini')
+        if os.path.exists(local_config):
+            self.config_path = local_config
+        self.config = configparser.ConfigParser()
+        self.load_config()
+        self.base_dir = os.path.dirname(os.path.abspath(self.config_path))
+        self._read_api_config()
+
+        prompt_file = self.config.get('prompts', 'system_prompt_file', fallback='system_prompt.txt')
+        self.system_prompt = self._load_prompt_file(prompt_file)
+        self.default_prompt = self.config.get('prompts', 'default_prompt')
+
+        self.screenshot_temp = self.config.get('settings', 'screenshot_temp')
+        self.screenshot_quality = self.config.getint('settings', 'screenshot_quality')
+        self.max_image_width = self.config.getint('settings', 'max_image_width')
+        self.command_delay = self.config.getfloat('settings', 'command_delay')
+        self.max_turns = self.config.getint('settings', 'max_turns')
+
+        # 同步会话历史中的系统提示词（用户可能改了提示词文件）
+        if self.conversation_history and self.conversation_history[0].get('role') == 'system':
+            self.conversation_history[0]['content'] = self.system_prompt
+        return self.model
+
+    def _normalize_api_url(self, url, fmt=None):
+        """自动补全API接口路径（根据API格式），兼容各家提供商的base写法。
+
+        OpenAI兼容（OpenAI/DeepSeek/MiMo/GLM/DashScope/Ollama等）：
+          .../chat/completions      -> 原样保留（完整端点）
+          .../v1、.../v4、.../v1beta -> + /chat/completions（识别任意版本段）
+          其它（如 api.openai.com）  -> + /v1/chat/completions
+        Anthropic（官方/Kimi/GLM等Anthropic兼容端点）：
+          .../messages              -> 原样保留
+          .../v1（等版本段）         -> + /messages
+          其它（如 api.anthropic.com、moonshot.cn/anthropic）-> + /v1/messages
+        查询串（如 Azure 的 ?api-version=...）原样保留，不参与路径补全。
+        """
+        fmt = (fmt or self.api_format or 'openai').strip().lower()
+        url = url.strip()
+
+        # 拆出查询串/锚点，只对路径部分做补全
+        query = ''
+        for sep in ('?', '#'):
+            if sep in url:
+                url, q = url.split(sep, 1)
+                query = sep + q
+                break
+        url = url.rstrip('/')
+
+        if fmt == 'anthropic':
             if url.endswith('/messages'):
-                return url
-            return url + '/messages'
+                return url + query
+            if re.search(r'/v\d+[^/]*$', url):
+                return url + '/messages' + query
+            return url + '/v1/messages' + query
 
-        # OpenAI兼容: {base}/chat/completions
-        known_endpoints = ['/chat/completions', '/completions', '/embeddings']
-        if any(url.endswith(ep) for ep in known_endpoints):
-            return url
-        if url.endswith('/v1'):
-            return url + '/chat/completions'
-        return url + '/v1/chat/completions'
+        # OpenAI兼容
+        if url.endswith('/chat/completions'):
+            return url + query
+        if re.search(r'/v\d+[^/]*$', url):
+            return url + '/chat/completions' + query
+        return url + '/v1/chat/completions' + query
 
     def _load_prompt_file(self, prompt_file):
-        """从txt文件加载系统提示词"""
+        """从txt文件加载系统提示词（依次查找：配置目录 → exe所在目录）"""
         if os.path.isabs(prompt_file):
-            path = prompt_file
+            candidates = [prompt_file]
         else:
-            path = os.path.join(self.base_dir, prompt_file)
+            candidates = [os.path.join(self.base_dir, prompt_file)]
+            app_path = os.path.join(self.app_dir, prompt_file)
+            if app_path not in candidates:
+                candidates.append(app_path)
 
-        if os.path.exists(path):
-            try:
-                with open(path, 'r', encoding='utf-8') as f:
-                    content = f.read().strip()
-                if content:
-                    print(f"[配置] 已加载提示词: {path}")
-                    return content
-            except Exception as e:
-                print(f"[警告] 读取提示词文件失败: {e}")
+        for path in candidates:
+            if os.path.exists(path):
+                try:
+                    with open(path, 'r', encoding='utf-8-sig') as f:
+                        content = f.read().strip()
+                    if content:
+                        print(f"[配置] 已加载提示词: {path}")
+                        return content
+                except Exception as e:
+                    print(f"[警告] 读取提示词文件失败: {e}")
 
-        print(f"[警告] 提示词文件不存在: {path}，使用内置默认提示词")
+        print(f"[警告] 提示词文件不存在: {candidates[0]}，使用内置默认提示词")
         return (
             "你是全自动电脑控制助手。你每次回复必须包含至少一个操作命令，"
             "或者输出 {wait 秒数}，或者输出 {stop} 结束任务。绝不允许向用户提问。"
@@ -414,13 +521,28 @@ class AIController:
             return self._call_anthropic()
         return self._call_openai()
 
+    def _build_openai_headers(self):
+        """根据 api_key 前缀智能选择认证方式，兼容 OpenAI/DeepSeek/Azure/DashScope/MiMo等。
+
+        - 以 sk- 开头            -> Authorization: Bearer sk-xxx
+        - 以 dashscope- 开头     -> Authorization: Bearer dashscope-xxx
+        - 含 Bearer/Api-Key 前缀 -> 原样使用（允许用户写完整头部值）
+        - 纯 key 无前缀          -> Authorization: Bearer {key}
+        """
+        key = (self.api_key or '').strip()
+        if not key:
+            return {"Content-Type": "application/json"}
+
+        if ' ' in key:
+            # 用户已提供完整头部值（如 "Api-Key xxxx" 或 "Bearer xxxx"）
+            return {"Content-Type": "application/json", "Authorization": key}
+
+        return {"Content-Type": "application/json", "Authorization": f"Bearer {key}"}
+
     def _call_openai(self):
-        """OpenAI兼容格式调用"""
+        """OpenAI兼容格式调用（支持OpenAI/DeepSeek/MiMo/GLM/Azure/DashScope/Ollama等）"""
         try:
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}"
-            }
+            headers = self._build_openai_headers()
             payload = {
                 "model": self.model,
                 "messages": self.conversation_history,
@@ -438,9 +560,15 @@ class AIController:
                 return None
 
             result = response.json()
-            message = result['choices'][0]['message']
+            # 兼容 choice 为空/格式差异
+            choices = result.get('choices') or []
+            if not choices:
+                text = result.get('content', '') or result.get('text', '') or result.get('response', '')
+                return text if text.strip() else None
+
+            message = choices[0].get('message') or choices[0]
             content = message.get('content') or ''
-            # 推理模型兜底
+            # 推理模型兜底（reasoning_content 存在于 DeepSeek-R1 等）
             if not content.strip():
                 reasoning = message.get('reasoning_content') or ''
                 if reasoning.strip():
@@ -458,7 +586,7 @@ class AIController:
             return None
 
     def _call_anthropic(self):
-        """Anthropic格式调用"""
+        """Anthropic格式调用（兼容官方API、Kimi、GLM、Minimax、第三方网关）"""
         try:
             # 分离system消息（Anthropic用单独的system参数）
             system_msg = ""
@@ -499,7 +627,8 @@ class AIController:
             headers = {
                 "Content-Type": "application/json",
                 "x-api-key": self.api_key,
-                "anthropic-version": "2023-06-01"
+                "anthropic-version": "2023-06-01",
+                "Authorization": f"Bearer {self.api_key}"  # 兼容需要Bearer的第三方网关
             }
             payload = {
                 "model": self.model,
@@ -519,11 +648,27 @@ class AIController:
                 return None
 
             result = response.json()
+            # 兼容官方 content blocks 格式
             content_blocks = result.get('content', [])
-            text = ""
-            for block in content_blocks:
-                if isinstance(block, dict) and block.get('type') == 'text':
-                    text += block.get('text', '')
+            if isinstance(content_blocks, list):
+                text = ""
+                for block in content_blocks:
+                    if isinstance(block, dict):
+                        if block.get('type') == 'text':
+                            text += block.get('text', '')
+                        elif block.get('type') == 'thinking':
+                            pass  # 忽略思考内容
+                    elif isinstance(block, str):
+                        text += block
+            elif isinstance(content_blocks, str):
+                text = content_blocks
+            else:
+                text = str(content_blocks)
+
+            # 第三方网关兼容：有些直接返回 {"text": "..."} 或 {"response": "..."}
+            if not text.strip():
+                text = result.get('text', '') or result.get('response', '') or result.get('completion', '')
+
             return text if text.strip() else None
 
         except requests.exceptions.Timeout:
@@ -539,10 +684,11 @@ class AIController:
     def _transcribe_image(self, image_base64):
         """调用转述模型，把截图转成文字描述（使用独立的转述API配置）"""
         try:
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.transcribe_api_key}"
-            }
+            headers = self._build_openai_headers()
+            # 若转述模型有独立API key，覆盖认证头
+            if self.transcribe_api_key != self.api_key:
+                key = (self.transcribe_api_key or '').strip()
+                headers["Authorization"] = key if ' ' in key else f"Bearer {key}"
             payload = {
                 "model": self.transcribe_model,
                 "messages": [
@@ -1314,6 +1460,10 @@ class AIController:
         other_executed = False
 
         for cmd_type, params in ordered_commands:
+            if self.stop_requested:
+                results.append("[已停止] 用户请求停止")
+                stop_flag = True
+                break
             # 所有其他指令执行完后，延时0.1秒再截图
             if cmd_type in ('print_screen', 'print_window') and other_executed:
                 time.sleep(0.1)
@@ -1409,164 +1559,418 @@ class AIController:
         return results, stop_flag
 
     # ------------------------------------------------------------------
-    # 全自动主循环
+    # 全自动任务执行
     # ------------------------------------------------------------------
-    def run(self):
-        """全自动运行循环：输入任务 -> AI自主操作直到 {stop}"""
-        print("\n[模式] 全自动：AI自主操作，无需人工干预")
-        print("[紧急停止] 任何时候按 Ctrl+C 可立即中止")
-        print("-" * 60)
+    def run_task(self, task):
+        """执行单个任务：AI自主操作直到 {stop}、达到最大轮次或被用户停止"""
+        task = (task or '').strip() or self.default_prompt
+        self.stop_requested = False
+        self.conversation_history = [{"role": "system", "content": self.system_prompt}]
 
-        while True:
-            # 获取任务
-            print(f"\n[默认任务] {self.default_prompt}")
-            print("[提示] 按Enter使用默认任务，或输入新任务；输入 quit 退出")
-            task = input("任务> ").strip()
+        # 任务后面附带系统配置信息（缓存，只收集一次）
+        sys_info = self._collect_system_info()
+        if sys_info:
+            task_msg = f"{task}\n\n---\n系统配置：\n{sys_info}"
+            print("\n[系统配置]")
+            print(sys_info)
+        else:
+            task_msg = task
 
-            if task.lower() in ['quit', 'exit', 'q']:
-                print("\n[退出] 感谢使用，再见！")
+        self.conversation_history.append({"role": "user", "content": task_msg})
+
+        print("\n" + "=" * 60)
+        print(f"[任务] {task}")
+        print("=" * 60)
+
+        empty_streak = 0
+
+        for turn in range(1, self.max_turns + 1 if self.max_turns > 0 else 10 ** 9):
+            if self.stop_requested:
+                print("\n[停止] 用户请求停止，任务中止")
                 break
-            if not task:
-                task = self.default_prompt
 
-            self.conversation_history = [{"role": "system", "content": self.system_prompt}]
+            # 调用主模型
+            print(f"\n[第{turn}轮] 调用主模型 {self.model} ...")
+            response_text = self._call_main_model()
 
-            # 任务后面附带系统配置信息（缓存，只收集一次）
-            sys_info = self._collect_system_info()
-            if sys_info:
-                task_msg = f"{task}\n\n---\n系统配置：\n{sys_info}"
-                print("\n[系统配置]")
-                print(sys_info)
-            else:
-                task_msg = task
+            if response_text is None:
+                print("[错误] 主模型无响应，任务中止")
+                break
 
-            self.conversation_history.append({"role": "user", "content": task_msg})
+            print(f"[AI] {response_text.strip()}")
 
-            print("\n" + "=" * 60)
-            print(f"[任务] {task}")
-            print("=" * 60)
+            # 记录AI回复
+            self.conversation_history.append({
+                "role": "assistant",
+                "content": response_text
+            })
+
+            # 解析命令
+            commands = self.parse_commands(response_text)
+
+            if not commands:
+                empty_streak += 1
+                print(f"[警告] 本轮无命令 (连续{empty_streak}次)")
+                if empty_streak >= 3:
+                    print("[停止] 连续3轮无命令，自动结束任务")
+                    break
+                self.conversation_history.append({
+                    "role": "user",
+                    "content": "你没有输出任何操作命令。请立即输出下一个操作命令，或者如果任务已完成请输出 {stop}。"
+                })
+                continue
 
             empty_streak = 0
 
-            for turn in range(1, self.max_turns + 1 if self.max_turns > 0 else 10 ** 9):
-                # 调用主模型
-                print(f"\n[第{turn}轮] 调用主模型 {self.model} ...")
-                response_text = self._call_main_model()
+            # 执行命令
+            print(f"[执行] {len(commands)} 个命令...")
+            results, stop_flag = self.execute_commands(commands)
 
-                if response_text is None:
-                    print("[错误] 主模型无响应，任务中止")
-                    break
+            for r in results:
+                print(f"  {r}")
 
-                print(f"[AI] {response_text.strip()}")
+            if stop_flag:
+                print("\n" + "=" * 60)
+                print("[任务完成] AI已停止操作")
+                print("=" * 60)
+                break
 
-                # 记录AI回复
-                self.conversation_history.append({
-                    "role": "assistant",
-                    "content": response_text
-                })
+            # 构建反馈消息
+            result_text = "\n".join(results) if results else "（无执行结果）"
 
-                # 解析命令
-                commands = self.parse_commands(response_text)
-
-                if not commands:
-                    empty_streak += 1
-                    print(f"[警告] 本轮无命令 (连续{empty_streak}次)")
-                    if empty_streak >= 3:
-                        print("[停止] 连续3轮无命令，自动结束任务")
-                        break
-                    self.conversation_history.append({
-                        "role": "user",
-                        "content": "你没有输出任何操作命令。请立即输出下一个操作命令，或者如果任务已完成请输出 {stop}。"
-                    })
-                    continue
-
-                empty_streak = 0
-
-                # 执行命令
-                print(f"[执行] {len(commands)} 个命令...")
-                results, stop_flag = self.execute_commands(commands)
-
-                for r in results:
-                    print(f"  {r}")
-
-                if stop_flag:
-                    print("\n" + "=" * 60)
-                    print("[任务完成] AI已停止操作")
-                    print("=" * 60)
-                    break
-
-                # 构建反馈消息
-                result_text = "\n".join(results) if results else "（无执行结果）"
-
-                if self.last_screenshot:
-                    if self.use_transcribe:
-                        # 模式1：截图 -> 转述模型转文字 -> 文字喂给主模型
-                        print("[转述] 截图转文字中...")
-                        desc = self._transcribe_image(self.last_screenshot)
-                        if desc:
-                            print(f"[屏幕描述] {desc.strip()}")
-                            next_msg = (
-                                f"命令执行结果：\n{result_text}\n\n"
-                                f"当前屏幕描述：\n{desc.strip()}\n\n"
-                                f"请根据以上信息决定下一步，输出下一个操作命令（或 {{stop}}）。"
-                            )
-                        else:
-                            next_msg = (
-                                f"命令执行结果：\n{result_text}\n\n"
-                                f"截图转述失败。请重新 {{print screen}} 或直接输出下一步操作命令（或 {{stop}}）。"
-                            )
+            if self.last_screenshot:
+                if self.use_transcribe:
+                    # 模式1：截图 -> 转述模型转文字 -> 文字喂给主模型
+                    print("[转述] 截图转文字中...")
+                    desc = self._transcribe_image(self.last_screenshot)
+                    if desc:
+                        print(f"[屏幕描述] {desc.strip()}")
+                        next_msg = (
+                            f"命令执行结果：\n{result_text}\n\n"
+                            f"当前屏幕描述：\n{desc.strip()}\n\n"
+                            f"请根据以上信息决定下一步，输出下一个操作命令（或 {{stop}}）。"
+                        )
                     else:
-                        # 模式2：截图直接发给主模型（同模型，多模态输入）
-                        print("[发送] 截图直接发送给主模型...")
-                        next_msg = [
-                            {
-                                "type": "text",
-                                "text": (
-                                    f"命令执行结果：\n{result_text}\n\n"
-                                    f"这是当前屏幕截图，请根据屏幕内容决定下一步，"
-                                    f"输出下一个操作命令（或 {{stop}}）。"
-                                )
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{self.last_screenshot}",
-                                    "detail": "high"
-                                }
-                            }
-                        ]
+                        next_msg = (
+                            f"命令执行结果：\n{result_text}\n\n"
+                            f"截图转述失败。请重新 {{print screen}} 或直接输出下一步操作命令（或 {{stop}}）。"
+                        )
                 else:
-                    next_msg = (
-                        f"命令执行结果：\n{result_text}\n\n"
-                        f"请输出下一个操作命令（或 {{stop}}）。"
-                    )
+                    # 模式2：截图直接发给主模型（同模型，多模态输入）
+                    print("[发送] 截图直接发送给主模型...")
+                    next_msg = [
+                        {
+                            "type": "text",
+                            "text": (
+                                f"命令执行结果：\n{result_text}\n\n"
+                                f"这是当前屏幕截图，请根据屏幕内容决定下一步，"
+                                f"输出下一个操作命令（或 {{stop}}）。"
+                            )
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{self.last_screenshot}",
+                                "detail": "high"
+                            }
+                        }
+                    ]
+            else:
+                next_msg = (
+                    f"命令执行结果：\n{result_text}\n\n"
+                    f"请输出下一个操作命令（或 {{stop}}）。"
+                )
 
-                self.conversation_history.append({"role": "user", "content": next_msg})
+            self.conversation_history.append({"role": "user", "content": next_msg})
 
-            print("\n" + "-" * 60)
-            print("[本轮任务结束] 输入 quit 退出，或输入新任务继续")
+        print("\n" + "-" * 60)
+        print("[本轮任务结束] 可输入新任务继续")
+
+
+def _dir_writable(path):
+    """实测目录是否可写（os.access在Windows上不检查ACL，不可靠）"""
+    try:
+        test_file = os.path.join(path, f'.aic_write_test_{os.getpid()}')
+        with open(test_file, 'w') as f:
+            f.write('')
+        os.remove(test_file)
+        return True
+    except OSError:
+        return False
+
+
+def _resolve_config_path(base_dir):
+    """确定config.ini路径。
+
+    优先级：
+    1. exe/脚本同目录的config.ini（已存在则直接用，兼容便携模式）
+    2. %APPDATA%\\AI_Controller\\config.ini（已存在的用户级配置）
+    3. 都不存在时：exe目录可写用exe目录，不可写（如Program Files）用APPDATA
+    """
+    local_path = os.path.join(base_dir, 'config.ini')
+    if os.path.exists(local_path):
+        return local_path
+
+    appdata = os.environ.get('APPDATA') or os.path.join(os.path.expanduser('~'), 'AppData', 'Roaming')
+    appdata_path = os.path.join(appdata, 'AI_Controller', 'config.ini')
+    if os.path.exists(appdata_path):
+        return appdata_path
+
+    if _dir_writable(base_dir):
+        return local_path
+    return appdata_path
+
+
+class _GuiLogWriter:
+    """把 print 输出包装为 ('log', s) 放入 UI 队列，由GUI线程消费（线程安全）"""
+
+    def __init__(self, ui_q):
+        self.ui_q = ui_q
+
+    def write(self, s):
+        if s:
+            self.ui_q.put(('log', s))
+
+    def flush(self):
+        pass
+
+
+class ControllerGUI:
+    """AI Controller 图形界面：任务输入 + 日志显示 + 开始/停止控制"""
+
+    def __init__(self):
+        import tkinter as tk
+        from tkinter import scrolledtext
+        self.tk = tk
+
+        self.root = tk.Tk()
+        self.root.title("AI Controller v2.0  |  全自动电脑控制助手")
+        self.root.geometry("760x560")
+        self.root.minsize(560, 400)
+        self.root.configure(bg='#f0f6ff')
+
+        # 图标（打包后优先用内嵌的icon.ico）
+        icon_candidates = []
+        if getattr(sys, 'frozen', False):
+            icon_candidates.append(os.path.join(sys._MEIPASS, 'icon.ico'))
+            icon_candidates.append(os.path.join(os.path.dirname(sys.executable), 'icon.ico'))
+        else:
+            icon_candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'icon.ico'))
+        for icon_path in icon_candidates:
+            if os.path.exists(icon_path):
+                try:
+                    self.root.iconbitmap(icon_path)
+                    break
+                except Exception:
+                    pass
+
+        font_ui = ("Microsoft YaHei UI", 10)
+        font_log = ("Consolas", 9)
+
+        # ===== 顶部：任务输入区 =====
+        top = tk.Frame(self.root, bg='#f0f6ff')
+        top.pack(fill='x', padx=12, pady=(12, 6))
+
+        tk.Label(top, text="任务：", font=font_ui, bg='#f0f6ff', fg='#1e3a8a').pack(side='left')
+
+        self.task_var = tk.StringVar()
+        self.task_entry = tk.Entry(top, textvariable=self.task_var, font=font_ui,
+                                   bg='white', fg='#1e3a8a', insertbackground='#1e3a8a',
+                                   relief='solid', bd=1)
+        self.task_entry.pack(side='left', fill='x', expand=True, padx=(4, 8), ipady=4)
+        self.task_entry.bind('<Return>', lambda e: self.start_task())
+
+        self.btn_start = tk.Button(top, text="开始", font=font_ui, width=7,
+                                   bg='#2563eb', fg='white', activebackground='#1d4ed8',
+                                   activeforeground='white', relief='flat', cursor='hand2',
+                                   command=self.start_task)
+        self.btn_start.pack(side='left', padx=(0, 6))
+
+        self.btn_stop = tk.Button(top, text="停止", font=font_ui, width=7,
+                                  bg='#dc2626', fg='white', activebackground='#b91c1c',
+                                  activeforeground='white', relief='flat', cursor='hand2',
+                                  state='disabled', command=self.stop_task)
+        self.btn_stop.pack(side='left')
+
+        self.btn_settings = tk.Button(top, text="设置", font=font_ui, width=6,
+                                      bg='#0891b2', fg='white', activebackground='#0e7490',
+                                      activeforeground='white', relief='flat', cursor='hand2',
+                                      state='disabled', command=self.open_settings)
+        self.btn_settings.pack(side='left', padx=(10, 0))
+
+        # ===== 中部：日志区 =====
+        self.log = scrolledtext.ScrolledText(self.root, font=font_log, wrap='word',
+                                             bg='#0f1e3d', fg='#dbeafe', insertbackground='#dbeafe',
+                                             relief='flat', state='disabled')
+        self.log.pack(fill='both', expand=True, padx=12, pady=(0, 6))
+
+        # ===== 底部：状态栏 =====
+        self.status_var = tk.StringVar(value="正在初始化...")
+        status = tk.Label(self.root, textvariable=self.status_var, font=("Microsoft YaHei UI", 9),
+                          bg='#e0ecff', fg='#1e3a8a', anchor='w', padx=10)
+        status.pack(fill='x', side='bottom')
+
+        # UI队列（日志+状态事件）& 任务队列
+        self.ui_q = queue.Queue()
+        self.task_q = queue.Queue()
+        self.controller = None
+        self.worker_running = True
+
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.after(50, self._poll_ui)
+
+        # 工作线程：创建控制器（含首次运行配置向导），随后等待任务
+        self.worker = threading.Thread(target=self._worker_loop, daemon=True)
+        self.worker.start()
+
+    # --------------------------------------------------------------
+    def _poll_ui(self):
+        """GUI线程定时消费UI队列（日志文本 + 状态事件），所有tk控件只在本线程操作"""
+        try:
+            while True:
+                kind, payload = self.ui_q.get_nowait()
+                if kind == 'log':
+                    self.log.configure(state='normal')
+                    self.log.insert('end', payload)
+                    self.log.configure(state='disabled')
+                    self.log.see('end')
+                elif kind == 'ready':
+                    self._on_ready()
+                elif kind == 'init_failed':
+                    self.status_var.set("初始化失败，请查看日志")
+                elif kind == 'task_start':
+                    self._on_task_start()
+                elif kind == 'task_end':
+                    self._on_task_end()
+                elif kind == 'config_reloaded':
+                    self.btn_settings.configure(state='normal')
+                    self.status_var.set(f"就绪 — 当前模型: {payload}")
+                elif kind == 'config_reload_failed':
+                    self.btn_settings.configure(state='normal')
+                    self.status_var.set("重载配置失败，请查看日志")
+        except queue.Empty:
+            pass
+        if self.worker_running:
+            self.root.after(50, self._poll_ui)
+
+    def _worker_loop(self):
+        """工作线程：初始化控制器 -> 循环等待并执行任务（只操作队列，不碰tk）"""
+        sys.stdout = _GuiLogWriter(self.ui_q)
+        sys.stderr = _GuiLogWriter(self.ui_q)
+        try:
+            base_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) \
+                else os.path.dirname(os.path.abspath(__file__))
+            config_path = _resolve_config_path(base_dir)
+            self.controller = AIController(config_path)
+            self.ui_q.put(('ready', None))
+        except Exception as e:
+            print(f"\n[致命错误] 初始化失败: {e}")
+            traceback.print_exc()
+            self.ui_q.put(('init_failed', None))
+            return
+
+        while self.worker_running:
+            try:
+                task = self.task_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if task is None:
+                break
+            if task == ('__reload_config__',):
+                # 「设置」按钮请求：向导关闭后重载配置（任务运行中会排队到任务结束后生效）
+                try:
+                    model = self.controller.reload_config()
+                    print(f"[设置] 配置已重新加载，当前模型: {model}")
+                    self.ui_q.put(('config_reloaded', model))
+                except Exception as e:
+                    print(f"[错误] 重载配置失败: {e}")
+                    traceback.print_exc()
+                    self.ui_q.put(('config_reload_failed', None))
+                continue
+            self.ui_q.put(('task_start', None))
+            try:
+                self.controller.run_task(task)
+            except Exception as e:
+                print(f"\n[错误] 任务执行异常: {e}")
+                traceback.print_exc()
+            self.ui_q.put(('task_end', None))
+
+    # --------------------------------------------------------------
+    def _on_ready(self):
+        default = self.controller.default_prompt if self.controller else ''
+        if default:
+            self.task_var.set(default)
+        self.status_var.set("就绪 — 输入任务后点击「开始」")
+        self.btn_settings.configure(state='normal')
+        self.task_entry.focus_set()
+
+    def _on_task_start(self):
+        self.btn_start.configure(state='disabled')
+        self.btn_stop.configure(state='normal')
+        self.btn_settings.configure(state='disabled')
+        self.status_var.set("运行中...")
+
+    def _on_task_end(self):
+        self.btn_start.configure(state='normal')
+        self.btn_stop.configure(state='disabled')
+        self.btn_settings.configure(state='normal')
+        self.status_var.set("就绪 — 输入任务后点击「开始」")
+
+    def start_task(self):
+        if not self.controller or self.btn_start['state'] == 'disabled':
+            return
+        self.task_q.put(self.task_var.get())
+
+    def stop_task(self):
+        if self.controller:
+            self.controller.stop_requested = True
+            self.status_var.set("正在停止...")
+            self.btn_stop.configure(state='disabled')
+
+    def open_settings(self):
+        """打开设置向导（config_set.exe），关闭后自动重载配置切换模型"""
+        if self.btn_settings['state'] == 'disabled':
+            return
+        base_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) \
+            else os.path.dirname(os.path.abspath(__file__))
+        wizard = os.path.join(base_dir, 'config_set.exe')
+        if not os.path.exists(wizard):
+            self.status_var.set("未找到 config_set.exe，无法打开设置")
+            return
+        self.btn_settings.configure(state='disabled')
+        self.status_var.set("设置窗口已打开，保存关闭后自动生效")
+        try:
+            proc = subprocess.Popen([wizard], cwd=base_dir)
+        except Exception as e:
+            self.btn_settings.configure(state='normal')
+            self.status_var.set(f"打开设置失败: {e}")
+            return
+
+        def _wait_wizard():
+            """GUI线程轮询向导进程，关闭后经任务队列通知工作线程重载配置"""
+            if proc.poll() is None:
+                self.root.after(300, _wait_wizard)
+                return
+            if self.controller is None:
+                self.btn_settings.configure(state='normal')
+                return
+            self.task_q.put(('__reload_config__',))
+        self.root.after(300, _wait_wizard)
+
+    def on_close(self):
+        self.worker_running = False
+        if self.controller:
+            self.controller.stop_requested = True
+        self.root.destroy()
+
+    def mainloop(self):
+        self.root.mainloop()
 
 
 def main():
-    """主函数"""
-    try:
-        if getattr(sys, 'frozen', False):
-            base_dir = os.path.dirname(sys.executable)
-        else:
-            base_dir = os.path.dirname(os.path.abspath(__file__))
-
-        config_path = os.path.join(base_dir, 'config.ini')
-        controller = AIController(config_path)
-        controller.run()
-
-    except KeyboardInterrupt:
-        print("\n\n[中断] 已按Ctrl+C，程序停止")
-    except Exception as e:
-        print(f"\n[致命错误] {e}")
-        import traceback
-        traceback.print_exc()
-    finally:
-        input("\n按Enter键退出...")
+    """主函数：启动GUI"""
+    app = ControllerGUI()
+    app.mainloop()
 
 
 if __name__ == '__main__':
